@@ -10,4 +10,6 @@
 | Presentation | `ui.lua` | main harness and export windows |
 | Optional integrations | `integration.lua` | BugGrabber/BugSack availability and UI bridge |
 
-Primary anchors: `Addon:AddFinding`, `Addon:AutoLoadOnUIOpen`, `Addon:LoadAddOnByName`, and the event frame plus `SlashCmdList["ROTHSECRETT"]` in `core.lua`.
+Primary anchors: `Addon:AddFinding`, `Addon:RegisterModule`, `Addon:LoadTester`, `Addon:LoadPack`, and the event frame plus `SlashCmdList["ROTHSECRETT"]` in `core.lua`.
+
+Detailed load/event/state routing is in [`AGENT_GUIDE.md`](AGENT_GUIDE.md).
