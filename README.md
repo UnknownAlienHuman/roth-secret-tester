@@ -22,3 +22,7 @@ The v1.6.4 core-stability and export-UX stage is documented as complete. Open wo
 ## Documentation
 
 The detailed operator material is retained in [Docs/README.md](Docs/README.md), including module, database, and export references. This repository adds [ARCHITECTURE.md](ARCHITECTURE.md), [CODE_INDEX.md](CODE_INDEX.md), and [CODE_GRAPH.md](CODE_GRAPH.md) as code-navigation aids.
+
+## License
+
+Licensed under the [MIT License](LICENSE). Bundled third-party components remain under their own notices.
