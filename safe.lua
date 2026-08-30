@@ -1,12 +1,11 @@
 -- safe.lua
--- Centralized SecretValue hardening helpers.
+-- Centralized SecretValue hardening helpers for Retail 12.1.
 --
--- IMPORTANT RULES (Midnight / SecretValue):
---  - Never use potentially secret values as table keys.
---  - Never concatenate or tostring() potentially secret values.
---  - Never do boolean tests on potentially secret values (if v then).
---
--- This module provides normalized, non-secret string keys and safe-to-string.
+-- Boundary rule:
+--  - canaccessvalue() is the first operation on an untrusted runtime value.
+--  - inaccessible values are never typed, compared, formatted, indexed, logged,
+--    persisted, or used as table keys.
+--  - pcall is an error boundary only; it never declassifies a value.
 
 local Addon = _G.RothSecretTesterCore
 if not Addon then return end
@@ -16,184 +15,226 @@ local Safe = Addon.Safe
 
 local type = type
 local tostring = tostring
+local tonumber = tonumber
 local pcall = pcall
+local pairs = pairs
+local format = string.format
 
--- Patch 12.0+: secret helpers
+local canaccessvalue = _G.canaccessvalue
 local issecretvalue = _G.issecretvalue
 local issecrettable = _G.issecrettable
-local scrubsecretvalues = _G.scrubsecretvalues
 
-local function try_scrub(v)
-    if type(scrubsecretvalues) ~= "function" then return true, v end
-    -- Signature is documented as: scrubsecretvalues(...) -> ... where secret inputs become nil.
-    local ok, r1 = pcall(scrubsecretvalues, v)
-    if not ok then
-        return false, v
+local function CanAccessValue(value)
+    if type(canaccessvalue) == "function" then
+        local ok, accessible = pcall(canaccessvalue, value)
+        return ok and accessible == true
     end
-    return true, r1
+
+    -- Compatibility fallback for older clients. Retail 12.1 is expected to
+    -- provide canaccessvalue(), so this path is not the current authority.
+    if type(issecretvalue) == "function" then
+        local ok, secret = pcall(issecretvalue, value)
+        return ok and secret ~= true
+    end
+
+    return true
 end
 
-function Safe:IsSecret(v)
-    -- NOTE: in 12.0+ there are multiple secret types (values, tables).
+local function IsSecretTable(value)
+    if type(issecrettable) ~= "function" then
+        return false
+    end
+
+    local ok, secret = pcall(issecrettable, value)
+    return ok and secret == true
+end
+
+function Safe:CanAccess(value)
+    return CanAccessValue(value)
+end
+
+function Safe:IsSecret(value)
+    if not CanAccessValue(value) then
+        return true
+    end
+
     if type(issecretvalue) == "function" then
-        local ok, r = pcall(issecretvalue, v)
-        if ok and r then return true end
+        local ok, secret = pcall(issecretvalue, value)
+        if ok and secret == true then
+            return true
+        end
     end
 
-    if type(v) == "table" and type(issecrettable) == "function" then
-        local ok, r = pcall(issecrettable, v)
-        if ok and r then return true end
-    end
-
-    -- Fallback: scrubsecretvalues returns nil for secret inputs.
-    local okScrub, r1 = try_scrub(v)
-    if okScrub and v ~= nil and r1 == nil then
+    -- type() is legal only after the accessibility gate above.
+    if type(value) == "table" and IsSecretTable(value) then
         return true
     end
 
     return false
 end
 
-function Safe:SafeToString(v)
-    if self:IsSecret(v) then
+function Safe:SafeToString(value)
+    if not CanAccessValue(value) then
+        return "<inaccessible>"
+    end
+    if self:IsSecret(value) then
         return "<secret>"
     end
-    local ok, s = pcall(tostring, v)
-    if ok then return s end
+
+    local ok, text = pcall(tostring, value)
+    if ok then
+        return text
+    end
     return "<tostring-error>"
 end
 
-function Safe:Key(v, opts)
+function Safe:Key(value, opts)
     opts = (type(opts) == "table") and opts or {}
 
-    if v == nil then
-        return opts.nilPlaceholder or "<nil>"
+    if not CanAccessValue(value) then
+        return opts.inaccessiblePlaceholder or opts.secretPlaceholder or "<inaccessible>"
     end
-
-    if self:IsSecret(v) then
+    if self:IsSecret(value) then
         return opts.secretPlaceholder or "<secret>"
     end
 
-    local tv = type(v)
-    if tv == "string" then
-        if v ~= "" then return v end
+    local valueType = type(value)
+    if valueType == "nil" then
+        return opts.nilPlaceholder or "<nil>"
+    end
+    if valueType == "string" then
+        if value ~= "" then
+            return value
+        end
         return opts.emptyPlaceholder or "<empty>"
     end
-
-    if tv == "boolean" then
-        return v and "true" or "false"
+    if valueType == "boolean" then
+        return value and "true" or "false"
     end
-
-    if tv == "number" then
+    if valueType == "number" then
         if opts.collapseNumbers then
             return opts.numberPlaceholder or "[*]"
         end
-        return self:SafeToString(v)
+        return self:SafeToString(value)
     end
 
-    return "<" .. tv .. ">"
+    return "<" .. valueType .. ">"
 end
 
-function Safe:KeyNoIndex(v)
-    -- Stricter key normalizer: never attempts to represent the value itself.
-    -- Useful if you're unsure about toString behavior.
-    if v == nil then return "<nil>" end
-    if self:IsSecret(v) then return "<secret>" end
-    local tv = type(v)
-    if tv == "string" then return v end
-    if tv == "number" then return "<num>" end
-    if tv == "boolean" then return v and "true" or "false" end
-    return "<" .. tv .. ">"
+function Safe:KeyNoIndex(value)
+    if not CanAccessValue(value) then
+        return "<inaccessible>"
+    end
+    if self:IsSecret(value) then
+        return "<secret>"
+    end
+
+    local valueType = type(value)
+    if valueType == "nil" then return "<nil>" end
+    if valueType == "string" then return value end
+    if valueType == "number" then return "<num>" end
+    if valueType == "boolean" then return value and "true" or "false" end
+    return "<" .. valueType .. ">"
 end
 
 -- -----------------------------------------
 -- SavedVariables-safe sanitization helpers
 -- -----------------------------------------
--- Goal: never persist SecretValues or huge nested tables in SavedVariables.
--- Used by Doctor + Log samples.
 
-local function _truncate(s, maxLen)
-    if type(s) ~= "string" then return s end
-    maxLen = tonumber(maxLen) or 160
-    if #s <= maxLen then return s end
-    return s:sub(1, maxLen) .. "…"
+local function Truncate(text, maxLength)
+    -- Callers pass only an accessible ordinary string.
+    maxLength = tonumber(maxLength) or 160
+    if #text <= maxLength then
+        return text
+    end
+    return text:sub(1, maxLength) .. "…"
 end
 
-local function _sanitizePrimitive(self, v, opts)
+local function SanitizePrimitive(self, value, opts)
     opts = (type(opts) == "table") and opts or {}
 
-    if v == nil then return nil end
-
-    -- Extra hardening: scrub first (handles cases where issecretvalue/issecrettable are absent or incomplete).
-    local okScrub, scrubbed = try_scrub(v)
-    if okScrub and scrubbed == nil and v ~= nil then
+    if not CanAccessValue(value) then
+        return opts.inaccessiblePlaceholder or opts.secretPlaceholder or "<inaccessible>"
+    end
+    if self:IsSecret(value) then
         return opts.secretPlaceholder or "<secret>"
     end
 
-    if self:IsSecret(v) then
-        return opts.secretPlaceholder or "<secret>"
+    local valueType = type(value)
+    if valueType == "nil" then
+        return nil
     end
-
-    local tv = type(v)
-    if tv == "string" then
-        return _truncate(v, opts.maxStringLen)
+    if valueType == "string" then
+        return Truncate(value, opts.maxStringLen)
     end
-    if tv == "number" then
+    if valueType == "number" then
         if opts.collapseNumbers then
             return opts.numberPlaceholder or "[*]"
         end
-        return v
+        return value
     end
-    if tv == "boolean" then
-        return v and true or false
+    if valueType == "boolean" then
+        return value
     end
 
-    -- Keep SavedVariables stable: represent non-serializable types as strings.
-    return "<" .. tv .. ">"
+    return "<" .. valueType .. ">"
 end
 
-local function _sanitizeTable(self, t, depth, visited, opts)
-    if t == nil then return nil end
+local function SanitizeValue(self, value, depth, visited, opts)
+    opts = (type(opts) == "table") and opts or {}
 
-    -- scrub/secret check must happen BEFORE type(table) iteration
-    local okScrub, scrubbed = try_scrub(t)
-    if okScrub and scrubbed == nil and t ~= nil then
-        return (opts and opts.secretPlaceholder) or "<secret>"
+    if not CanAccessValue(value) then
+        return opts.inaccessiblePlaceholder or opts.secretPlaceholder or "<inaccessible>"
+    end
+    if self:IsSecret(value) then
+        return opts.secretPlaceholder or "<secret>"
     end
 
-    if self:IsSecret(t) then return (opts and opts.secretPlaceholder) or "<secret>" end
-    if type(t) ~= "table" then return _sanitizePrimitive(self, t, opts) end
+    local valueType = type(value)
+    if valueType ~= "table" then
+        return SanitizePrimitive(self, value, opts)
+    end
+
+    -- Do not enumerate a table marked secret even if the table object itself is
+    -- accessible in the current context.
+    if IsSecretTable(value) then
+        return opts.secretPlaceholder or "<secret>"
+    end
 
     depth = tonumber(depth) or 2
-    if depth <= 0 then return "<table>" end
-
-    visited = visited or {}
-    if visited[t] then return "<cycle>" end
-    visited[t] = true
-
-    opts = (type(opts) == "table") and opts or {}
-    local maxItems = tonumber(opts.maxItems) or 50
-
-    local out = {}
-    local n = 0
-    for k, v in pairs(t) do
-        n = n + 1
-        if n > maxItems then
-            out["<truncated>"] = string.format("…(+%d)", n - maxItems)
-            break
-        end
-        -- Keys must be safe + deterministic.
-        local sk = self:Key(k, { collapseNumbers = true, secretPlaceholder = "<secret_key>" })
-        out[sk] = _sanitizeTable(self, v, depth - 1, visited, opts)
+    if depth <= 0 then
+        return "<table>"
     end
 
-    visited[t] = nil
-    return out
+    visited = visited or {}
+    if visited[value] then
+        return "<cycle>"
+    end
+    visited[value] = true
+
+    local maxItems = tonumber(opts.maxItems) or 50
+    local output = {}
+    local itemCount = 0
+
+    for key, child in pairs(value) do
+        itemCount = itemCount + 1
+        if itemCount > maxItems then
+            output["<truncated>"] = format("…(+%d)", itemCount - maxItems)
+            break
+        end
+
+        local safeKey = self:Key(key, {
+            collapseNumbers = true,
+            inaccessiblePlaceholder = "<inaccessible_key>",
+            secretPlaceholder = "<secret_key>",
+        })
+        output[safeKey] = SanitizeValue(self, child, depth - 1, visited, opts)
+    end
+
+    visited[value] = nil
+    return output
 end
 
-function Safe:Sanitize(v, depth, opts)
-    -- Returns a SavedVariables-safe representation.
-    -- Tables are copied and bounded; non-serializable types become strings.
-    return _sanitizeTable(self, v, depth, nil, opts)
+function Safe:Sanitize(value, depth, opts)
+    return SanitizeValue(self, value, depth, nil, opts)
 end
-
